@@ -198,19 +198,25 @@ class AsyncRealtimeChannel:
         """Generates the event name for replies."""
         return f"chan_reply_{ref}"
 
-    def on(self, event: str, callback: EventCallback) -> None:
+    def on(
+        self,
+        event: str,
+        callback: EventCallback,
+        filter: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """
-        Registers a callback for a specific event.
+        Registers a callback for a specific event with an optional filter.
 
         Args:
             event (str): The event name.
             callback (EventCallback): The callback function.
+            filter (Optional[Dict[str, Any]]): An optional dictionary of filters to apply.
         """
         if not asyncio.iscoroutinefunction(callback):
             raise ValueError("Callback must be an async function.")
         event = event.lower()
         bindings = self._bindings.setdefault(event, [])
-        binding = Binding(event_type=event, callback=callback, filter={})
+        binding = Binding(event_type=event, callback=callback, filter=filter or {})
         bindings.append(binding)
 
     def off(self, event: str, callback: EventCallback) -> None:
@@ -239,13 +245,45 @@ class AsyncRealtimeChannel:
     async def _trigger(
         self, event: str, payload: Optional[Any], ref: Optional[str] = None
     ) -> None:
-        """Triggers callbacks registered for an event."""
-        bindings = self._bindings.get(event.lower(), [])
-        for binding in bindings:
-            try:
-                await binding.callback(payload, ref)
-            except Exception as e:
-                logger.exception(f"Exception in callback for event '{event}': {e}")
+        """Triggers callbacks registered for an event, respecting filters."""
+        event_lower = event.lower()
+        handled_payload = payload  # In case we need to modify it
+
+        if event_lower in ["insert", "update", "delete"]:
+            # Handle Postgres changes events
+            bindings = self._bindings.get("postgres_changes", [])
+            for binding in bindings:
+                bind_event = binding.filter.get("event", "*").lower()
+                if bind_event in ("*", event_lower):
+                    try:
+                        await binding.callback(handled_payload, ref)
+                    except Exception as e:
+                        logger.exception(
+                            f"Exception in callback for event '{event}': {e}"
+                        )
+        else:
+            # Handle other events
+            bindings = self._bindings.get(event_lower, [])
+            for binding in bindings:
+                if event_lower in ["broadcast", "presence", "postgres_changes"]:
+                    bind_event = binding.filter.get("event", "*").lower()
+                    payload_event = (payload.get("event", "") or "").lower()
+                    if bind_event in ("*", payload_event):
+                        try:
+                            await binding.callback(handled_payload, ref)
+                        except Exception as e:
+                            logger.exception(
+                                f"Exception in callback for event '{event}': {e}"
+                            )
+                else:
+                    # For other events, match the event type directly
+                    if binding.event_type.lower() == event_lower:
+                        try:
+                            await binding.callback(handled_payload, ref)
+                        except Exception as e:
+                            logger.exception(
+                                f"Exception in callback for event '{event}': {e}"
+                            )
 
     async def send_broadcast(self, event: str, payload: Dict[str, Any]) -> None:
         """
